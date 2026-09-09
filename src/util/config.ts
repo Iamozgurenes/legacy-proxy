@@ -26,6 +26,8 @@ export interface ProviderConfig {
 export interface AppConfig {
   port: number;
   publicUrl: string;
+  /** Browser origins allowed to authenticate with the HttpOnly session cookie. */
+  cookieAuthOrigins: string[];
   dataDir: string;
   vaultKey: Buffer;
   sessionHmacKey: Buffer;
@@ -68,6 +70,10 @@ export function loadConfig(): AppConfig {
   return {
     port: Number(process.env.PORT ?? 8080),
     publicUrl: process.env.PUBLIC_URL ?? `http://localhost:${process.env.PORT ?? 8080}`,
+    cookieAuthOrigins: (process.env.COOKIE_AUTH_ORIGINS ?? "")
+      .split(",")
+      .map((origin) => origin.trim().replace(/\/+$/, ""))
+      .filter(Boolean),
     dataDir,
     vaultKey: b64Key("VAULT_KEY", null),
     sessionHmacKey: b64Key("SESSION_HMAC_KEY", null),

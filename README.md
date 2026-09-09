@@ -279,6 +279,7 @@ URLs from `PUBLIC_URL` into `apiUrl`, `downloadUrl`, `uploadUrl`, and
 | -------------------------- | ---------------------------------- | ---------------------------------------------------- |
 | `PORT`                     | `8080`                             | HTTP listen port                                     |
 | `PUBLIC_URL`               | `http://localhost:$PORT`           | URL clients see; baked into the Session resource     |
+| `COOKIE_AUTH_ORIGINS`      | unset                              | Comma-separated webmail origins allowed to use HttpOnly cookie sessions |
 | `DATA_DIR`                 | `./data` (or `/data` in Docker)    | SQLite database, vault entries, upload bodies        |
 | `VAULT_KEY`                | required                           | base64 of 32 bytes; AES-256-GCM credential vault     |
 | `SESSION_HMAC_KEY`         | required                           | base64 of 32 bytes; HMAC-SHA-256 over session tokens |

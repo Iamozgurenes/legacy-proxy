@@ -19,6 +19,51 @@ import { PushDispatcher } from "./push/dispatcher.js";
 import { PushIdleManager } from "./push/idle.js";
 
 const cfg = loadConfig();
+const COOKIE_SESSION_NAME = "legacy_proxy_session";
+const COOKIE_SESSION_MAX_AGE = 60 * 60 * 24 * 30;
+const MAX_COOKIE_SESSION_SLOTS = 5;
+
+function cookieSessionSlot(value: unknown): number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value < MAX_COOKIE_SESSION_SLOTS
+    ? value
+    : 0;
+}
+
+function cookieSessionName(slot: number): string {
+  return slot === 0 ? COOKIE_SESSION_NAME : `${COOKIE_SESSION_NAME}_${slot}`;
+}
+
+function requestOrigin(headers: Record<string, string | string[] | undefined>): string | null {
+  const value = headers.origin;
+  return typeof value === "string" ? value.replace(/\/+$/, "") : null;
+}
+
+function isCookieOriginAllowed(headers: Record<string, string | string[] | undefined>): boolean {
+  const origin = requestOrigin(headers);
+  return origin !== null && cfg.cookieAuthOrigins.includes(origin);
+}
+
+function readCookie(headers: Record<string, string | string[] | undefined>, name: string): string | null {
+  const raw = headers.cookie;
+  if (typeof raw !== "string") return null;
+  for (const part of raw.split(";")) {
+    const separator = part.indexOf("=");
+    if (separator < 0 || part.slice(0, separator).trim() !== name) continue;
+    try {
+      return decodeURIComponent(part.slice(separator + 1).trim());
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function sessionCookie(token: string, persistent: boolean, slot: number): string {
+  const secure = cfg.publicUrl.startsWith("https://") ? "; Secure" : "";
+  const maxAge = persistent ? `; Max-Age=${COOKIE_SESSION_MAX_AGE}` : "";
+  return `${cookieSessionName(slot)}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax${secure}${maxAge}`;
+}
+
 const store = new Store(cfg.dataDir);
 const pool = new ImapPool(cfg, store);
 const hub = new EventSourceHub();
@@ -50,7 +95,7 @@ const app = Fastify({
   disableRequestLogging: false,
 });
 
-await app.register(cors, { origin: true });
+await app.register(cors, { origin: true, credentials: true });
 // JMAP responses with bodyValues are large, highly compressible JSON —
 // hundreds of KB shrink to tens. The SSE route is unaffected: it writes to
 // reply.raw directly, bypassing the onSend hook this plugin uses.
@@ -65,8 +110,14 @@ app.post("/api/login", async (req, reply) => {
     accessToken?: string;
     provider?: string;
     mech?: "PLAIN" | "LOGIN" | "XOAUTH2";
+    cookieSession?: boolean;
+    rememberMe?: boolean;
+    slot?: number;
   };
   if (!body?.username) return reply.code(400).send({ error: "username required" });
+  if (body.cookieSession && !isCookieOriginAllowed(req.headers)) {
+    return reply.code(403).send({ error: "cookie sessions are not allowed for this origin" });
+  }
 
   const providerName = resolveProviderName(cfg, { explicit: body.provider, username: body.username });
   const provider = resolveProvider(cfg, providerName);
@@ -97,8 +148,25 @@ app.post("/api/login", async (req, reply) => {
   // Reuse the probe as the account's pooled connection instead of logging out
   // and paying a second TCP+TLS+LOGIN when the client's first JMAP call lands.
   pool.adopt(account, probe);
-  const token = signSession(cfg.sessionHmacKey, makeSession({ accountSlug: slug, username: body.username }));
+  const token = signSession(cfg.sessionHmacKey, makeSession({
+    accountSlug: slug,
+    username: body.username,
+    ttlSec: body.rememberMe === true ? COOKIE_SESSION_MAX_AGE : undefined,
+  }));
+  if (body.cookieSession) {
+    reply.header("Set-Cookie", sessionCookie(token, body.rememberMe === true, cookieSessionSlot(body.slot)));
+    return { accountId: String(account.id), apiUrl: `${cfg.publicUrl}/jmap` };
+  }
   return { token, accountId: String(account.id), apiUrl: `${cfg.publicUrl}/jmap` };
+});
+
+app.post("/api/logout", async (req, reply) => {
+  if (!isCookieOriginAllowed(req.headers)) {
+    return reply.code(403).send({ error: "cookie sessions are not allowed for this origin" });
+  }
+  const body = (req.body ?? {}) as { slot?: number };
+  reply.header("Set-Cookie", sessionCookie("", false, cookieSessionSlot(body.slot)) + "; Max-Age=0");
+  return { ok: true };
 });
 
 app.get("/.well-known/jmap", async (_req, reply) => {
@@ -399,16 +467,15 @@ async function authn(req: {
   headers: Record<string, string | string[] | undefined>;
 }): Promise<import("./state/store.js").AccountRow | null> {
   const h = req.headers["authorization"];
-  if (typeof h !== "string") return null;
 
-  if (h.startsWith("Bearer ")) {
+  if (typeof h === "string" && h.startsWith("Bearer ")) {
     const token = h.slice("Bearer ".length).trim();
     const sess = verifySession(cfg.sessionHmacKey, token);
     if (!sess) return null;
     return store.getAccount(sess.accountSlug) ?? null;
   }
 
-  if (h.startsWith("Basic ")) {
+  if (typeof h === "string" && h.startsWith("Basic ")) {
     const cacheKey = crypto.createHash("sha256").update(h).digest("hex");
     const cached = basicAuthCache.get(cacheKey);
     if (cached && cached.expires > Date.now()) {
@@ -444,6 +511,20 @@ async function authn(req: {
     pool.adopt(account, probe);
     basicAuthCache.set(cacheKey, { accountId: account.id, expires: Date.now() + BASIC_TTL_MS });
     return account;
+  }
+
+  // Cookie auth is deliberately restricted to explicitly configured browser
+  // origins. The token is HttpOnly, so the webmail can restore a session
+  // without receiving either the upstream password or a bearer token.
+  if (isCookieOriginAllowed(req.headers)) {
+    const rawSlot = req.headers["x-jmap-cookie-slot"];
+    const parsedSlot = typeof rawSlot === "string" ? Number(rawSlot) : 0;
+    const slot = cookieSessionSlot(parsedSlot);
+    const token = readCookie(req.headers, cookieSessionName(slot));
+    if (token) {
+      const sess = verifySession(cfg.sessionHmacKey, token);
+      if (sess) return store.getAccount(sess.accountSlug) ?? null;
+    }
   }
 
   return null;

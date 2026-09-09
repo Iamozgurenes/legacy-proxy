@@ -10,6 +10,7 @@ services:
       DATA_DIR: /data
       LOG_LEVEL: info
       PUBLIC_URL: http://localhost:8080
+      COOKIE_AUTH_ORIGINS: ${COOKIE_AUTH_ORIGINS:-http://localhost:3000}
       VAULT_KEY: ${VAULT_KEY}
       SESSION_HMAC_KEY: ${SESSION_HMAC_KEY}
       DEFAULT_PROVIDER: ${DEFAULT_PROVIDER:-generic}
