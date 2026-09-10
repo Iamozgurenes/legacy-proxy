@@ -59,9 +59,16 @@ function readCookie(headers: Record<string, string | string[] | undefined>, name
 }
 
 function sessionCookie(token: string, persistent: boolean, slot: number): string {
-  const secure = cfg.publicUrl.startsWith("https://") ? "; Secure" : "";
+  // Webmail origins are allowed cross-site (e.g. sigortamail.sigortalia.com
+  // calling jmap.idealsigorta.com), so SameSite=Lax would silently drop the
+  // cookie on those fetches -- Lax only rides along for same-site requests.
+  // SameSite=None requires Secure, so only use it once we're on https;
+  // http (local dev) keeps Lax since browsers reject a Secure-less None.
+  const isHttps = cfg.publicUrl.startsWith("https://");
+  const sameSite = isHttps ? "None" : "Lax";
+  const secure = isHttps ? "; Secure" : "";
   const maxAge = persistent ? `; Max-Age=${COOKIE_SESSION_MAX_AGE}` : "";
-  return `${cookieSessionName(slot)}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax${secure}${maxAge}`;
+  return `${cookieSessionName(slot)}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=${sameSite}${secure}${maxAge}`;
 }
 
 const store = new Store(cfg.dataDir);
