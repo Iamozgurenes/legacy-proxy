@@ -33,8 +33,21 @@ export interface BodyStructurePart {
   subParts?: BodyStructurePart[];
 }
 
+// RFC 8621 §4.1.4 form 2: a convenience alternative to `bodyStructure`.
+// Clients that don't want to hand-build the MIME tree send textBody/htmlBody
+// plus a flat `attachments` list instead, and the server assembles the
+// multipart/mixed (+ multipart/related for inline parts) wrapper itself.
+export interface AttachmentRef {
+  blobId?: string;
+  type?: string | null;
+  name?: string | null;
+  disposition?: string | null;
+  cid?: string | null;
+}
+
 export interface JmapEmailCreate {
   bodyStructure?: BodyStructurePart | null;
+  attachments?: AttachmentRef[] | null;
   from?: JmapAddress[] | null;
   sender?: JmapAddress[] | null;
   to?: JmapAddress[] | null;
@@ -133,6 +146,24 @@ export interface BlobLookup {
   (blobId: string): { body: Buffer; ctype: string } | null;
 }
 
+// Build a single attachment leaf (form 2's `attachments` entries mirror
+// bodyStructure leaves closely enough to share the header/content logic,
+// but they carry their own type/name/disposition/cid fields directly rather
+// than a BodyStructurePart tree).
+function nodeFromAttachment(att: AttachmentRef, getBlob: BlobLookup, hostname: string): MimeNode | null {
+  if (!att.blobId) return null;
+  const blob = getBlob(att.blobId);
+  if (!blob) return null;
+  const contentType = att.type || blob.ctype || "application/octet-stream";
+  const node = new MimeNode(contentType, { hostname });
+  const disp = att.disposition ?? "attachment";
+  const filename = att.name ? `; filename="${att.name.replace(/"/g, "")}"` : "";
+  node.setHeader("Content-Disposition", `${disp}${filename}`);
+  if (att.cid) node.setHeader("Content-ID", `<${att.cid}>`);
+  node.setContent(blob.body);
+  return node;
+}
+
 export async function buildRfc822(
   create: JmapEmailCreate,
   hostname: string,
@@ -148,16 +179,42 @@ export async function buildRfc822(
   } else {
     const text = resolveBody(create.textBody, create.bodyValues);
     const html = resolveBody(create.htmlBody, create.bodyValues);
+    let bodyNode: MimeNode;
     if (text && html) {
-      root = new MimeNode("multipart/alternative", { hostname });
-      root.createChild("text/plain; charset=utf-8").setContent(text);
-      root.createChild("text/html; charset=utf-8").setContent(html);
+      bodyNode = new MimeNode("multipart/alternative", { hostname });
+      bodyNode.createChild("text/plain; charset=utf-8").setContent(text);
+      bodyNode.createChild("text/html; charset=utf-8").setContent(html);
     } else if (html) {
-      root = new MimeNode("text/html; charset=utf-8", { hostname });
-      root.setContent(html);
+      bodyNode = new MimeNode("text/html; charset=utf-8", { hostname });
+      bodyNode.setContent(html);
     } else {
-      root = new MimeNode("text/plain; charset=utf-8", { hostname });
-      root.setContent(text ?? "");
+      bodyNode = new MimeNode("text/plain; charset=utf-8", { hostname });
+      bodyNode.setContent(text ?? "");
+    }
+
+    // Form 2 (RFC 8621 §4.1.4): assemble the multipart/related (inline
+    // parts referenced by cid) and multipart/mixed (regular attachments)
+    // wrappers around the text/html body ourselves — clients using this
+    // form never build a bodyStructure tree at all.
+    const attachmentNodes = (create.attachments ?? [])
+      .map((att) => ({ att, node: nodeFromAttachment(att, getBlob, hostname) }))
+      .filter((x): x is { att: AttachmentRef; node: MimeNode } => x.node !== null);
+    const inline = attachmentNodes.filter((x) => x.att.disposition === "inline");
+    const regular = attachmentNodes.filter((x) => x.att.disposition !== "inline");
+
+    let contentNode = bodyNode;
+    if (inline.length > 0) {
+      contentNode = new MimeNode("multipart/related", { hostname });
+      contentNode.appendChild(bodyNode);
+      for (const { node } of inline) contentNode.appendChild(node);
+    }
+
+    if (regular.length > 0) {
+      root = new MimeNode("multipart/mixed", { hostname });
+      root.appendChild(contentNode);
+      for (const { node } of regular) root.appendChild(node);
+    } else {
+      root = contentNode;
     }
   }
 

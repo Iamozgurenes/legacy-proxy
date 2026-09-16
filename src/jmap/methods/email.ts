@@ -1522,9 +1522,14 @@ async function applyEmailCreate(
   // Fresh /jmap/upload blobs live in SQLite and resolve synchronously;
   // blobIds naming an existing message part (forwards, reused inline
   // images) need an async IMAP round trip, so resolve those up front into a
-  // map buildRfc822's synchronous getBlob can read from.
+  // map buildRfc822's synchronous getBlob can read from. Attachments can
+  // arrive via either RFC 8621 §4.1.4 form — an explicit bodyStructure tree
+  // or the flat `attachments` convenience list — so both need walking.
   const blobIds = new Set<string>();
   collectBlobIds((payload as JmapEmailCreate).bodyStructure, blobIds);
+  for (const att of (payload as JmapEmailCreate).attachments ?? []) {
+    if (att?.blobId) blobIds.add(att.blobId);
+  }
   const emailBackedBlobs = new Map<string, { body: Buffer; ctype: string }>();
   for (const blobId of blobIds) {
     if (blobId.startsWith("U")) continue;
