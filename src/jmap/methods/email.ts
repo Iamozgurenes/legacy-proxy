@@ -1,7 +1,7 @@
 import type { ImapFlow } from "imapflow";
 import type { AccountRow, Store, EmailCacheUpsert } from "../../state/store.js";
 import type { ImapPool } from "../../imap/pool.js";
-import { decodeEmailId, decodeMailboxId, encodeBlobId, encodeEmailId, encodeMailboxId } from "../../mapping/ids.js";
+import { decodeBlobId, decodeEmailId, decodeMailboxId, encodeBlobId, encodeEmailId, encodeMailboxId } from "../../mapping/ids.js";
 import { encodeEmailState } from "../../state/states.js";
 import { fetchEmailsBatch, type JmapEmail } from "../../imap/fetcher.js";
 import { withMailbox } from "../../imap/client.js";
@@ -13,7 +13,7 @@ import { mapWithConcurrency } from "../../util/concurrency.js";
 import { projectHeaderProp } from "../../imap/headers.js";
 import { buildThreadIndex } from "./threads.js";
 import { keywordToFlag } from "../../mapping/flags.js";
-import { buildRfc822, type JmapEmailCreate } from "../../mapping/buildMime.js";
+import { buildRfc822, type BodyStructurePart, type JmapEmailCreate } from "../../mapping/buildMime.js";
 import {
   changesFromLog,
   changesOrCannotCalculate,
@@ -1399,6 +1399,86 @@ interface CreatedEmailResult {
   size: number;
 }
 
+// Same cache horizon the /jmap/download route uses for email-backed blobs
+// (server.ts's BLOB_CACHE_TTL_MS) — kept as a local constant to avoid a
+// circular import between server.ts and this module.
+const EMAIL_BLOB_CACHE_TTL_MS = 7 * 24 * 60 * 60_000;
+
+// Walk a bodyStructure tree collecting every blobId referenced by a leaf
+// part (attachments, inline images). Composing a message never nests a
+// blobId-bearing part under another blobId-bearing part, so a flat list is
+// enough — we don't need to track which parent each one came from.
+function collectBlobIds(part: BodyStructurePart | null | undefined, out: Set<string>): void {
+  if (!part) return;
+  if (part.blobId) out.add(part.blobId);
+  for (const child of part.subParts ?? []) collectBlobIds(child, out);
+}
+
+// Resolve a blobId that names an existing message part (forwarded
+// attachment, reused inline image) rather than a fresh /jmap/upload. Checks
+// the blob cache first, then falls back to an IMAP FETCH — mirroring the
+// /jmap/download route's non-"U" path, but buffering fully since the whole
+// attachment has to live in the outgoing MIME anyway.
+async function resolveEmailBackedBlob(
+  blobId: string,
+  ctx: MailCtx,
+): Promise<{ body: Buffer; ctype: string } | null> {
+  const cached = ctx.store.getCachedBlob(blobId, ctx.account.id);
+  if (cached) return { body: cached.body, ctype: cached.ctype ?? "application/octet-stream" };
+
+  let parsed;
+  try {
+    parsed = decodeBlobId(blobId);
+  } catch {
+    return null;
+  }
+  let emailParts;
+  try {
+    emailParts = decodeEmailId(parsed.emailId);
+  } catch {
+    return null;
+  }
+  if (emailParts.accountIdx !== ctx.account.id) return null;
+  const mbox = ctx.store
+    .prep(`SELECT name FROM mailbox WHERE id = ? AND account_id = ?`)
+    .get(emailParts.mailboxIdx, ctx.account.id) as { name: string } | undefined;
+  if (!mbox) return null;
+
+  // No pool means a test harness context without one; fall through to
+  // borrowing the request's own interactive connection instead.
+  const withClient = ctx.pool
+    ? (fn: (client: ImapFlow) => Promise<{ body: Buffer; ctype: string } | null>) =>
+        ctx.pool!.withConnection(ctx.account, "bulk", fn)
+    : (fn: (client: ImapFlow) => Promise<{ body: Buffer; ctype: string } | null>) => fn(ctx.client);
+
+  const result = await withClient((client) =>
+    withMailbox(client, mbox.name, async () => {
+      const dl = await client.download(`${emailParts.uid}`, parsed.partId ?? undefined, { uid: true });
+      if (!dl) return null;
+      const chunks: Buffer[] = [];
+      for await (const chunk of dl.content as AsyncIterable<Buffer>) chunks.push(chunk);
+      const ctype = parsed.partId ? dl.meta?.contentType ?? "application/octet-stream" : "message/rfc822";
+      return { body: Buffer.concat(chunks), ctype };
+    }),
+  );
+  if (!result) return null;
+
+  try {
+    ctx.store.putCachedBlob({
+      id: blobId,
+      accountId: ctx.account.id,
+      ctype: result.ctype,
+      body: result.body,
+      ttlMs: EMAIL_BLOB_CACHE_TTL_MS,
+    });
+  } catch (e) {
+    // Best-effort cache write; a fresh-uploaded draft must still send even
+    // if this fails.
+    log.warn({ err: (e as Error).message }, "blob cache write failed during send");
+  }
+  return result;
+}
+
 async function applyEmailCreate(
   payload: Record<string, unknown>,
   ctx: MailCtx,
@@ -1439,10 +1519,23 @@ async function applyEmailCreate(
     }
   }
 
+  // Fresh /jmap/upload blobs live in SQLite and resolve synchronously;
+  // blobIds naming an existing message part (forwards, reused inline
+  // images) need an async IMAP round trip, so resolve those up front into a
+  // map buildRfc822's synchronous getBlob can read from.
+  const blobIds = new Set<string>();
+  collectBlobIds((payload as JmapEmailCreate).bodyStructure, blobIds);
+  const emailBackedBlobs = new Map<string, { body: Buffer; ctype: string }>();
+  for (const blobId of blobIds) {
+    if (blobId.startsWith("U")) continue;
+    const resolved = await resolveEmailBackedBlob(blobId, ctx);
+    if (resolved) emailBackedBlobs.set(blobId, resolved);
+  }
+
   const mime = await buildRfc822(
     payload as JmapEmailCreate,
     ctx.account.host || "localhost",
-    (blobId) => ctx.store.getUpload(blobId, ctx.account.id),
+    (blobId) => ctx.store.getUpload(blobId, ctx.account.id) ?? emailBackedBlobs.get(blobId) ?? null,
   );
 
   const idate = typeof payload.receivedAt === "string" ? new Date(payload.receivedAt) : undefined;
