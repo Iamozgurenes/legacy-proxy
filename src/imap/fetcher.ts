@@ -224,6 +224,14 @@ function processMeta(account: AccountRow, mailbox: MailboxRow, raw: RawMeta): Pr
   return { raw, emailId, blobId, threadId, root, sel, headers };
 }
 
+// A malformed/missing IMAP date (bad INTERNALDATE, unparsable envelope
+// Date header) must not take down the whole Email/get batch it's part of --
+// fall back instead of letting toISOString() throw on an Invalid Date.
+function safeISOString(value: unknown, fallback: string): string {
+  const d = new Date(value as string | number | Date);
+  return isNaN(d.getTime()) ? fallback : d.toISOString();
+}
+
 function assembleEmail(
   account: AccountRow,
   mailbox: MailboxRow,
@@ -233,6 +241,8 @@ function assembleEmail(
 ): JmapEmail {
   const env = p.raw.envelope;
   const referencesIds = asMessageIds(p.headers, "References");
+  const epoch = new Date(0).toISOString();
+  const receivedAt = safeISOString(p.raw.internaldate, epoch);
   return {
     id: p.emailId,
     blobId: p.blobId,
@@ -242,7 +252,7 @@ function assembleEmail(
     },
     keywords: flagsToKeywords(Array.from(p.raw.flags ?? [])),
     size: p.raw.size,
-    receivedAt: new Date(p.raw.internaldate).toISOString(),
+    receivedAt,
     messageId: env?.messageId ? [stripBrackets(env.messageId)] : null,
     inReplyTo: env?.inReplyTo ? [stripBrackets(env.inReplyTo)] : null,
     references: referencesIds,
@@ -253,7 +263,7 @@ function assembleEmail(
     bcc: addr(env?.bcc),
     replyTo: addr(env?.replyTo),
     subject: env?.subject ?? null,
-    sentAt: env?.date ? new Date(env.date).toISOString() : null,
+    sentAt: env?.date ? safeISOString(env.date, receivedAt) : null,
     hasAttachment: p.sel.hasAttachment,
     preview,
     bodyStructure: p.root,
