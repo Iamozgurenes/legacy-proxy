@@ -100,6 +100,11 @@ const app = Fastify({
   loggerInstance: log,
   bodyLimit: cfg.limits.maxSizeRequest,
   disableRequestLogging: false,
+  // The download route carries the attachment filename as a path segment.
+  // Fastify's default 100-char param limit is measured on the still
+  // percent-encoded segment, so a long Turkish filename (each ç/ş/ü is 6
+  // chars, each space 3) 404s before reaching the handler.
+  routerOptions: { maxParamLength: 2048 },
 });
 
 await app.register(cors, { origin: true, credentials: true });
