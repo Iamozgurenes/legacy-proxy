@@ -4,10 +4,17 @@ name: Build and publish Docker image
 # GitHub's free arm runners), pushed by digest, then merged into one manifest.
 # No QEMU: emulated Node/V8 crashes with SIGILL during `npm install` often
 # enough that multi-arch builds under qemu-user are not dependable.
+#
+# Images are published from main and v* tags only. For an image of another
+# branch, run this workflow by hand on that branch.
+#
+# Every published manifest list gets a signed build provenance attestation,
+# pushed to GHCR next to it:
+# `gh attestation verify oci://ghcr.io/bulwarkmail/legacy-proxy:<tag> --owner bulwarkmail`.
 
 on:
   push:
-    branches: ["**"]
+    branches: [main]
     tags: ["v*"]
   pull_request:
     branches: [main]
@@ -93,6 +100,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
 
     steps:
       - name: Download digests
@@ -131,4 +140,16 @@ jobs:
             $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
 
       - name: Inspect manifest
-        run: docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+        id: inspect
+        run: |
+          docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          digest=$(docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }} --format '{{json .Manifest}}' | jq -r .digest)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.inspect.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
