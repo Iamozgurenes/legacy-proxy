@@ -13,12 +13,25 @@ const SYSTEM: ReadonlyArray<[string, string]> = [
 const KW_TO_FLAG = new Map<string, string>(SYSTEM);
 const FLAG_TO_KW = new Map<string, string>(SYSTEM.map(([k, f]) => [f.toLowerCase(), k]));
 
-const SAFE_FLAG = /^[A-Za-z0-9$_\\.-]+$/;
+// RFC 8621 §4.1.1: a keyword is 1-255 chars from the ASCII range %x21-%x7e,
+// excluding `( ) { ] % * " \`. Clients rely on the full range -- the
+// webmail's own tag feature, for one, keys nested tags like "$label:work/clients"
+// on the `:` and `/` this used to reject as "unsafe".
+const EXCLUDED_FLAG_CHARS = new Set(["(", ")", "{", "]", "%", "*", "\"", "\\"]);
+
+function isSafeFlag(kw: string): boolean {
+  if (kw.length < 1 || kw.length > 255) return false;
+  for (const ch of kw) {
+    const code = ch.codePointAt(0)!;
+    if (code < 0x21 || code > 0x7e || EXCLUDED_FLAG_CHARS.has(ch)) return false;
+  }
+  return true;
+}
 
 export function keywordToFlag(kw: string): string {
   const sys = KW_TO_FLAG.get(kw);
   if (sys) return sys;
-  if (!SAFE_FLAG.test(kw)) throw new Error(`unsafe keyword: ${kw}`);
+  if (!isSafeFlag(kw)) throw new Error(`unsafe keyword: ${kw}`);
   return kw;
 }
 

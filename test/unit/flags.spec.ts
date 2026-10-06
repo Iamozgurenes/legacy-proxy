@@ -18,7 +18,12 @@ describe("flags ↔ keywords", () => {
   });
   it("rejects unsafe custom keywords", () => {
     expect(() => keywordToFlag("bad space")).toThrow();
-    expect(() => keywordToFlag("bad/slash")).toThrow();
+    expect(() => keywordToFlag("bad(paren")).toThrow();
+    expect(() => keywordToFlag("")).toThrow();
+  });
+  it("allows the full RFC 8621 keyword character set, slash and colon included", () => {
+    // Nested tags (webmail's own) key on exactly these: `$label:work/clients`.
+    expect(keywordToFlag("$label:work/clients")).toBe("$label:work/clients");
   });
   it("roundtrips a flag set", () => {
     const flags = ["\\Seen", "\\Flagged", "MyLabel"];
