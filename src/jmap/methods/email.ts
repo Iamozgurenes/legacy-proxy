@@ -11,7 +11,7 @@ import { compileFilter, UnsupportedFilter, type Filter } from "../../imap/search
 import { listMailboxes, refreshMailboxCounts } from "./mailbox.js";
 import { log } from "../../util/log.js";
 import { mapWithConcurrency } from "../../util/concurrency.js";
-import { projectHeaderProp } from "../../imap/headers.js";
+import { headersToEmailHeaders, projectHeaderProp } from "../../imap/headers.js";
 import { buildThreadIndex } from "./threads.js";
 import { keywordToFlag } from "../../mapping/flags.js";
 import { buildRfc822, type JmapEmailCreate } from "../../mapping/buildMime.js";
@@ -766,11 +766,11 @@ export async function emailGet(
   // list views and saves one IMAP round trip per Email/get page.
   const wantsPreview =
     args.properties === undefined || args.properties.includes("preview");
-  // Only `header:*` projections need the complete header block; everything
-  // else (references, threading) is covered by the threading-field subset,
-  // which is a fraction of the bytes on modern messages.
+  // Only `headers` and `header:*` projections need the complete header block;
+  // everything else (references, threading) is covered by the threading-field
+  // subset, which is a fraction of the bytes on modern messages.
   const needsFullHeaders =
-    args.properties?.some((p) => p.startsWith("header:")) ?? false;
+    args.properties?.some((p) => p === "headers" || p.startsWith("header:")) ?? false;
   const bodyOpts = {
     fetchTextBodyValues: args.fetchTextBodyValues,
     fetchHTMLBodyValues: args.fetchHTMLBodyValues,
@@ -874,6 +874,10 @@ function projectEmailForGet(
     if (p === "id") continue;
     if (p.startsWith("header:")) {
       out[p] = projectHeaderProp(headers, p);
+      continue;
+    }
+    if (p === "headers") {
+      out.headers = headersToEmailHeaders(headers);
       continue;
     }
     // Plain top-level property; copy through if we have it.
