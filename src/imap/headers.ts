@@ -79,6 +79,14 @@ export function asRaw(headers: ParsedHeader[], name: string): string | null {
   return " " + matches[matches.length - 1]!.rawValue;
 }
 
+// The Email `headers` property (RFC 8621 §4.1.3): every header field in
+// message order, values in Raw form -- same convention as asRaw above.
+export function headersToEmailHeaders(
+  headers: ParsedHeader[],
+): { name: string; value: string }[] {
+  return headers.map((h) => ({ name: h.name, value: " " + h.rawValue }));
+}
+
 export function asText(headers: ParsedHeader[], name: string): string | null {
   const raw = asRaw(headers, name);
   if (raw == null) return null;

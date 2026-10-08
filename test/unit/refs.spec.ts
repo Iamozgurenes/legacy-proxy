@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { resolveArgs, jsonPointer } from "../../src/jmap/refs.js";
+import { resolveArgs, jsonPointer, harvestCreatedIds, type CreatedIds } from "../../src/jmap/refs.js";
 
 describe("JMAP back-references", () => {
   it("resolves a simple #ref", () => {
@@ -48,5 +48,29 @@ describe("JMAP back-references", () => {
       accountId: "1",
       create: { sub1: { emailId: "real-id-42" } },
     });
+  });
+});
+
+describe("harvestCreatedIds", () => {
+  it("harvests creation ids from Email/import so EmailSubmission can reference them", () => {
+    const ids: CreatedIds = new Map();
+    harvestCreatedIds(ids, "Email/import", {
+      created: { "raw-import": { id: "AQOcz7DBBrkJ", blobId: "b", threadId: "t", size: 1 } },
+    });
+    expect(ids.get("raw-import")).toBe("AQOcz7DBBrkJ");
+    expect(resolveArgs({ create: { s: { emailId: "#raw-import" } } }, {}, ids)).toEqual({
+      create: { s: { emailId: "AQOcz7DBBrkJ" } },
+    });
+  });
+
+  it("harvests from */set and */copy but not from reads", () => {
+    const ids: CreatedIds = new Map();
+    harvestCreatedIds(ids, "Email/set", { created: { a: { id: "1" } } });
+    harvestCreatedIds(ids, "Email/copy", { created: { b: { id: "2" } } });
+    harvestCreatedIds(ids, "Email/get", { created: { c: { id: "3" } } });
+    expect([...ids]).toEqual([
+      ["a", "1"],
+      ["b", "2"],
+    ]);
   });
 });
