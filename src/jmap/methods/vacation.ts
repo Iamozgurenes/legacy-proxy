@@ -46,6 +46,26 @@ function rememberVacation(store: Store, accountId: number, props: VacationProps)
   });
 }
 
+// A Sieve host that's unreachable (firewalled port, dead IP) doesn't get more
+// reachable between now and the next call. Without this, every client that
+// polls VacationResponse/get while the server's down retries the full
+// connect timeout on every single call -- this short-circuits those for a
+// while so a stuck Sieve host degrades one slow failure per account instead
+// of an unbounded stream of them. Deliberately shorter than the success TTL:
+// we want to notice a fix quickly, not just reduce load while it's broken.
+const VACATION_FAILURE_TTL_MS = 20_000;
+const recentFailures = new Map<number, { error: Error; failedAt: number }>();
+
+function recentFailure(accountId: number): Error | null {
+  const entry = recentFailures.get(accountId);
+  if (!entry) return null;
+  if (Date.now() - entry.failedAt >= VACATION_FAILURE_TTL_MS) {
+    recentFailures.delete(accountId);
+    return null;
+  }
+  return entry.error;
+}
+
 export async function vacationGet(
   args: { accountId: string; ids?: string[] | null },
   ctx: { account: AccountRow; provider: ProviderConfig; creds: Credentials; store: Store },
@@ -54,12 +74,17 @@ export async function vacationGet(
   if (!ctx.provider.sieve) throw forbidden();
   let v = cachedVacation(ctx.store, ctx.account.id);
   if (!v) {
+    const failure = recentFailure(ctx.account.id);
+    if (failure) throw failure;
     const c = new SieveClient({ ...ctx.provider.sieve, creds: ctx.creds });
-    await c.connect();
     try {
+      await c.connect();
       v = await readVacation(c);
+    } catch (err) {
+      recentFailures.set(ctx.account.id, { error: err as Error, failedAt: Date.now() });
+      throw err;
     } finally {
-      await c.logout();
+      await c.logout().catch(() => {});
     }
     rememberVacation(ctx.store, ctx.account.id, v);
   }

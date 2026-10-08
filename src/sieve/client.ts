@@ -16,7 +16,17 @@ interface SieveOpts {
   secure?: boolean;
   creds: Credentials;
   servername?: string;
+  /** Overridable for tests; production relies on the default. */
+  connectTimeoutMs?: number;
 }
+
+// With no deadline, a host that silently drops packets (firewalled port,
+// dead IP) leaves `connect()` hanging until the OS's own TCP retry timeout
+// -- ~130s on Linux -- holding a socket/fd open the whole time. Every call
+// that misses the vacation-read cache opens one of these, so a persistently
+// unreachable Sieve port turns into a slow file-descriptor leak instead of a
+// fast, visible failure.
+const DEFAULT_CONNECT_TIMEOUT_MS = 8_000;
 
 export interface SieveScriptInfo {
   name: string;
@@ -26,7 +36,7 @@ export interface SieveScriptInfo {
 export class SieveClient {
   private sock!: Socket | TLSSocket;
   private buf = Buffer.alloc(0);
-  private pending: ((line: string) => void) | null = null;
+  private pending: { resolve: (line: string) => void; reject: (err: Error) => void } | null = null;
   private capabilities = new Map<string, string>();
   private opts: SieveOpts;
 
@@ -35,7 +45,35 @@ export class SieveClient {
   }
 
   async connect(): Promise<void> {
-    await new Promise<void>((resolve, reject) => {
+    // One deadline for the whole handshake (TCP connect, greeting, STARTTLS,
+    // AUTHENTICATE) -- a server that accepts the connection but never speaks
+    // would otherwise hang readLine() just as indefinitely as a dead TCP
+    // connect does.
+    const timeoutMs = this.opts.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      this.sock?.destroy();
+    }, timeoutMs);
+    try {
+      await this.connectSocket();
+      await this.readGreeting();
+      if (this.opts.starttls && !(this.sock instanceof TLSSocket)) {
+        await this.startTls();
+      }
+      await this.authenticate();
+    } catch (err) {
+      if (timedOut) {
+        throw new Error(`SIEVE handshake timed out after ${timeoutMs}ms: ${this.opts.host}:${this.opts.port}`);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private connectSocket(): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
       const onErr = (e: Error) => reject(e);
       this.sock = this.opts.secure
         ? tlsConnect({ host: this.opts.host, port: this.opts.port, servername: this.opts.servername ?? this.opts.host }, () => {
@@ -47,23 +85,34 @@ export class SieveClient {
             resolve();
           });
       this.sock.on("error", onErr);
-      this.sock.on("data", (chunk: Buffer) => {
-        this.buf = Buffer.concat([this.buf, chunk]);
-        if (this.pending) {
-          const line = this.tryReadLine();
-          if (line !== null) {
-            const cb = this.pending;
-            this.pending = null;
-            cb(line);
-          }
-        }
-      });
+      this.wireDataAndClose();
     });
-    await this.readGreeting();
-    if (this.opts.starttls && !(this.sock instanceof TLSSocket)) {
-      await this.startTls();
-    }
-    await this.authenticate();
+  }
+
+  // A destroy() mid-read (the handshake deadline firing, or the peer just
+  // closing the socket) must reject whatever readLine() is waiting on --
+  // otherwise that pending Promise, which only ever resolves from 'data',
+  // hangs forever even though the socket is long gone.
+  private wireDataAndClose(): void {
+    this.sock.on("data", (chunk: Buffer) => {
+      this.buf = Buffer.concat([this.buf, chunk]);
+      if (this.pending) {
+        const line = this.tryReadLine();
+        if (line !== null) {
+          const cb = this.pending;
+          this.pending = null;
+          cb.resolve(line);
+        }
+      }
+    });
+    const rejectPending = (err: Error) => {
+      if (!this.pending) return;
+      const cb = this.pending;
+      this.pending = null;
+      cb.reject(err);
+    };
+    this.sock.on("close", () => rejectPending(new Error("SIEVE connection closed")));
+    this.sock.on("error", rejectPending);
   }
 
   private tryReadLine(): string | null {
@@ -77,8 +126,8 @@ export class SieveClient {
   private async readLine(): Promise<string> {
     const line = this.tryReadLine();
     if (line !== null) return line;
-    return await new Promise<string>((resolve) => {
-      this.pending = resolve;
+    return await new Promise<string>((resolve, reject) => {
+      this.pending = { resolve, reject };
     });
   }
 
@@ -113,17 +162,7 @@ export class SieveClient {
     });
     this.sock = tls;
     this.buf = Buffer.alloc(0);
-    this.sock.on("data", (chunk: Buffer) => {
-      this.buf = Buffer.concat([this.buf, chunk]);
-      if (this.pending) {
-        const line = this.tryReadLine();
-        if (line !== null) {
-          const cb = this.pending;
-          this.pending = null;
-          cb(line);
-        }
-      }
-    });
+    this.wireDataAndClose();
     this.capabilities.clear();
     await this.readGreeting();
   }
